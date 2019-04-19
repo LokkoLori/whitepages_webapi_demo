@@ -11,4 +11,5 @@ python interpreter: 2.7
 required pip installs:
 
 - fuzzywuzzy
+- usaddress
 - tornado
