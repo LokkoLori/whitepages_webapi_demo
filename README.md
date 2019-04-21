@@ -11,5 +11,6 @@ python interpreter: 2.7
 required pip installs:
 
 - fuzzywuzzy
+- (optional) python-Levenshtein
 - usaddress
 - tornado

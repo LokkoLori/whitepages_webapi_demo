@@ -1,7 +1,12 @@
+import tornado.ioloop
+import tornado.web
+import tornado.gen
+from tornado.httpclient import AsyncHTTPClient
 import csv
 from fuzzywuzzy import fuzz
 from io import StringIO
 import urllib.parse
+import urllib.request
 import json
 import usaddress
 
@@ -11,7 +16,6 @@ api_key_find_person = '44c5b314db5b4dd0a9a7c2454fbbdd02'
 
 revese_phone_url_format = "https://proapi.whitepages.com/3.0/phone.json"
 find_person_url_format = "https://proapi.whitepages.com/3.0/person"
-
 
 def urlparams(url, **kwargs):
 
@@ -38,21 +42,62 @@ def extractaddress(wp_addr_dict):
     raddrd = [ad for ad in raddrd if ad and ad != "None"]
     return ", ".join(raddrd)
 
+http_client = AsyncHTTPClient(max_clients=20)
+
 '''
 represent a contact, it has 3 fileds: name, address, phone
 '''
 class Contact():
 
-    all_contacts = []
 
-    def __init__(self, name, address, phone):
-        self.name = name
-        self.address = address
-        self.phone = phone
-        Contact.all_contacts.append(self)
+    def __init__(self, form, row, idx):
 
-        # single thread experiment
+        self.row = row
+        self.idx = idx
+        self.form = form
+
+        self.name = row[form.contact_filed_idx[0]]
+        self.address = row[form.contact_filed_idx[1]]
+        self.phone = row[form.contact_filed_idx[2]]
+
         self.get_data_from_whitepages()
+
+    def writeback(self):
+
+        self.row[self.form.contact_filed_idx[0]] = self.name
+        self.row[self.form.contact_filed_idx[1]] = self.address
+        self.row[self.form.contact_filed_idx[2]] = self.phone
+
+        self.form.feedback(self.idx)
+
+    def on_fetch_reverse_phone(self, f):
+
+        rdata = json.loads(f.result().body)
+
+        if rdata.get("belongs_to"):
+            # todo: check if it similar to the original data ... but what if it is not?
+            self.name = rdata["belongs_to"][0].get("name")
+        if rdata.get("current_addresses"):
+            self.address = extractaddress(rdata["current_addresses"][0])
+
+        self.writeback()
+
+    def on_fetch_find_person(self, f):
+
+        rdata = json.loads(f.result().body)
+
+        if type(rdata.get("person")) is not list or not rdata["person"]:
+            return
+
+        person = rdata["person"][0]
+        if person.get("name"):
+            self.name = person["name"]
+        if person.get("phones") and person["phones"][0].get("phone_number"):
+            self.phone = person["phones"][0]["phone_number"]
+        if person.get("found_at_address"):
+            self.address = extractaddress(person["found_at_address"])
+
+        self.writeback()
 
     def get_data_from_whitepages(self):
         # this is the main processing method, push it into thread a pool for parallel processing...
@@ -64,15 +109,8 @@ class Contact():
             url = urlparams(revese_phone_url_format, api_key=api_key_reverse_phone, phone=self.phone)
             print("request: {}".format(url))
 
-            with urllib.request.urlopen(url) as response:
-                rdata = json.loads(response.read())
-
-                if rdata.get("belongs_to"):
-                    #todo: check if it similar to the original data ... but what if it is not?
-                    self.name = rdata["belongs_to"][0].get("name")
-                if rdata.get("current_addresses"):
-                    self.address = extractaddress(rdata["current_addresses"][0])
-
+            fetch = http_client.fetch(url)
+            fetch.add_done_callback(self.on_fetch_reverse_phone)
             return
 
         #fill data by name and address, find person api
@@ -102,25 +140,14 @@ class Contact():
                         address__state_code=state,
                         address__street_line_1=street
                         )
+
         print("request: {}".format(url))
-
-        with urllib.request.urlopen(url) as response:
-            rdata = json.loads(response.read())
-
-            if type(rdata.get("person")) is not list or not rdata["person"]:
-                return
-
-            person = rdata["person"][0]
-            if person.get("name"):
-                self.name = person["name"]
-            if person.get("phones") and person["phones"][0].get("phone_number"):
-                self.phone = person["phones"][0]["phone_number"]
-            if person.get("found_at_address"):
-                self.address = extractaddress(person["found_at_address"])
+        fetch = http_client.fetch(url)
+        fetch.add_done_callback(self.on_fetch_find_person)
 
 
 '''
-a class reprezent the csv data
+a class represent the csv data
 '''
 class CSV_form():
 
@@ -146,15 +173,22 @@ class CSV_form():
             self.contact_filed_idx.append(maxind)
 
         self.data = [] #data format : (original row, Contact extracted from row)
+        self.waiting = True
+        self.done_row_count = 0
+
+
+    def feedback(self, idx):
+        self.done_row_count += 1
+
+        if self.done_row_count == len(self.data):
+            s = StringIO()
+            self.write_to(s)
+            print(s.getvalue())
+
 
     def addRow(self, row):
 
-        self.data.append((row,
-                          Contact(
-                              name=row[self.contact_filed_idx[0]],
-                              address=row[self.contact_filed_idx[1]],
-                              phone=row[self.contact_filed_idx[2]])
-                         ))
+        self.data.append(Contact(self, row, len(self.data)))
 
     def write_to(self, f):
         '''
@@ -166,14 +200,7 @@ class CSV_form():
 
         for data in self.data:
 
-            row = list(data[0])
-
-            contact = data[1]
-            row[self.contact_filed_idx[0]] = contact.name
-            row[self.contact_filed_idx[1]] = contact.address
-            row[self.contact_filed_idx[2]] = contact.phone
-
-            f.write(",".join(['"' + d + '"' for d in row]) + "\n")
+            f.write(",".join(['"' + d + '"' for d in data.row]) + "\n")
 
 
 def process_csv(input, output):
@@ -194,11 +221,25 @@ def process_csv(input, output):
         else:
             csv_form.addRow(row)
 
-    csv_form.write_to(output)
+
+class MainHandler(tornado.web.RequestHandler):
+    def get(self):
+        with open("sample.txt", encoding="utf-8") as f:
+            with open("result.csv", "w", encoding="utf-8") as r:
+                process_csv(f, r)
+
+def make_app():
+    return tornado.web.Application([
+        (r"/", MainHandler),
+    ])
 
 
 if __name__ == "__main__":
 
-    with open("sample.txt", encoding="utf-8") as f:
-        with open("result.csv", "w", encoding="utf-8") as r:
-            process_csv(f, r)
+    port = 8080
+    app = make_app()
+    app.listen(port)
+    print("listening at {}".format(port))
+    tornado.ioloop.IOLoop.current().start()
+
+
