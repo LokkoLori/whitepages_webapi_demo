@@ -60,7 +60,9 @@ class Contact():
         self.address = row[form.contact_filed_idx[1]]
         self.phone = row[form.contact_filed_idx[2]]
 
-        self.get_data_from_whitepages()
+        self.url = ""
+        self.callback = None
+        self.set_url_and_callback()
 
     def writeback(self):
 
@@ -68,11 +70,11 @@ class Contact():
         self.row[self.form.contact_filed_idx[1]] = self.address
         self.row[self.form.contact_filed_idx[2]] = self.phone
 
-        self.form.feedback(self.idx)
+        print("Response processed {}".format(self.url))
 
-    def on_fetch_reverse_phone(self, f):
+    def on_fetch_reverse_phone(self, resp):
 
-        rdata = json.loads(f.result().body)
+        rdata = json.loads(resp.body)
 
         if rdata.get("belongs_to"):
             # todo: check if it similar to the original data ... but what if it is not?
@@ -82,9 +84,9 @@ class Contact():
 
         self.writeback()
 
-    def on_fetch_find_person(self, f):
+    def on_fetch_find_person(self, resp):
 
-        rdata = json.loads(f.result().body)
+        rdata = json.loads(resp.body)
 
         if type(rdata.get("person")) is not list or not rdata["person"]:
             return
@@ -99,18 +101,15 @@ class Contact():
 
         self.writeback()
 
-    def get_data_from_whitepages(self):
+    def set_url_and_callback(self):
         # this is the main processing method, push it into thread a pool for parallel processing...
 
 
         # fill data by phone number
         if self.phone:
 
-            url = urlparams(revese_phone_url_format, api_key=api_key_reverse_phone, phone=self.phone)
-            print("request: {}".format(url))
-
-            fetch = http_client.fetch(url)
-            fetch.add_done_callback(self.on_fetch_reverse_phone)
+            self.url = urlparams(revese_phone_url_format, api_key=self.form.rp_api_key, phone=self.phone)
+            self.callback = self.on_fetch_reverse_phone
             return
 
         #fill data by name and address, find person api
@@ -133,17 +132,24 @@ class Contact():
         city = city.replace(",", "").strip()
         street = street.replace(",", "").strip()
 
-        url = urlparams(find_person_url_format, api_key=api_key_find_person,
+        self.url = urlparams(find_person_url_format, api_key=self.form.fp_api_key,
                         name=self.name,
                         address__city=city,
                         address__postal_code=postal_code,
                         address__state_code=state,
                         address__street_line_1=street
                         )
+        self.callback = self.on_fetch_find_person
 
-        print("request: {}".format(url))
-        fetch = http_client.fetch(url)
-        fetch.add_done_callback(self.on_fetch_find_person)
+    async def fetch(self):
+
+        http_client = AsyncHTTPClient()
+
+        print("Fetching request {}".format(self.url))
+
+        resp = await http_client.fetch(self.url)
+        return resp
+
 
 
 '''
@@ -151,9 +157,13 @@ a class represent the csv data
 '''
 class CSV_form():
 
-    def __init__(self, field_list):
+    def __init__(self, field_list, rp_api_key, fp_api_key, parallel_batch_size):
         self.field_list = field_list
         self.contact_filed_idx = []
+        self.rp_api_key = rp_api_key
+        self.fp_api_key = fp_api_key
+        self.parallel_batch_size = parallel_batch_size
+
         expected_fields = ("name", "address", "phone")
 
         #do the fuzzy matching (experimental)
@@ -172,23 +182,12 @@ class CSV_form():
                 raise Exception("excepted field: '{}' cannot found in the first row of given csv".format(field))
             self.contact_filed_idx.append(maxind)
 
-        self.data = [] #data format : (original row, Contact extracted from row)
-        self.waiting = True
-        self.done_row_count = 0
-
-
-    def feedback(self, idx):
-        self.done_row_count += 1
-
-        if self.done_row_count == len(self.data):
-            s = StringIO()
-            self.write_to(s)
-            print(s.getvalue())
+        self.rows = [] #data format : (original row, Contact extracted from row)
 
 
     def addRow(self, row):
 
-        self.data.append(Contact(self, row, len(self.data)))
+        self.rows.append(Contact(self, row, len(self.rows)))
 
     def write_to(self, f):
         '''
@@ -198,16 +197,37 @@ class CSV_form():
         '''
         f.write(",".join(['"'+f+'"' for f in self.field_list])+"\n")
 
-        for data in self.data:
+        for data in self.rows:
 
             f.write(",".join(['"' + d + '"' for d in data.row]) + "\n")
 
 
-def process_csv(input, output):
+    async def processContacts(self):
+
+        #here comes the multi async magic
+        first = 0
+
+        while True:
+            last = first + self.parallel_batch_size
+            if len(self.rows) < last:
+                last = len(self.rows)
+            parallel_batch = self.rows[first:last]
+            responses = await tornado.gen.multi([cont.fetch() for cont in parallel_batch])
+            for i in range(len(parallel_batch)):
+                parallel_batch[i].callback(responses[i])
+            if last == len(self.rows):
+                break
+            first = last
+
+
+
+async def process_csv(input, output, rp_api_key, fp_api_key, parallel_batch_size):
     '''
     accept a csv text from the input then write the filled csv data on the output ... these could be files id StringIO
     :param input: iostream
     :param output: iostream
+    :param rp_api_key: str - reverse phone API key to whitepages
+    :param fp_api_key: str - find person API kez to whitepages
     :return:
     '''
 
@@ -216,10 +236,13 @@ def process_csv(input, output):
     first_row = True
     for row in reader:
         if first_row:
-            csv_form = CSV_form(row)
+            csv_form = CSV_form(row, rp_api_key, fp_api_key, parallel_batch_size)
             first_row = False
         else:
             csv_form.addRow(row)
+
+    await csv_form.processContacts()
+    csv_form.write_to(output)
 
 
 class FormHandler(tornado.web.RequestHandler):
@@ -235,6 +258,7 @@ class FormHandler(tornado.web.RequestHandler):
         <input type="file" name="csv"/>csv file<br/>
         <input type="text" name="api_key_rp" value="{}"/>reverse phone api key<br/>
         <input type="text" name="api_key_fp" value="{}"/>find person api key<br/>
+        <input type="text" name="parallel_batch_size" value="20"/>paralell  batch size<br/>
         <input type="submit" value="Submit"/>
         </form></body></html>
         """.format(api_key_rp, api_key_fp)
@@ -250,8 +274,24 @@ class ApiHandler(tornado.web.RequestHandler):
 
     async def post(self):
 
+        print("INCOMING REQUEST")
         self.set_header("Content-Type", "text/csv")
-        self.write("hello csv")
+        try:
+            text = self.request.files["csv"][0]['body'].decode("utf-8")
+            input = StringIO(text)
+        except Exception as e:
+            #todo: raise no input like exception
+            return
+
+        output = StringIO()
+
+        rp_api_key = self.request.body_arguments["api_key_rp"][0].decode("utf-8")
+        fp_api_key = self.request.body_arguments["api_key_fp"][0].decode("utf-8")
+        parallel_batch_size = int(self.request.body_arguments["parallel_batch_size"][0].decode("utf-8"))
+        await process_csv(input, output, rp_api_key, fp_api_key, parallel_batch_size)
+
+        print("RESPOND SUCCESS")
+        self.write(output.getvalue())
 
 def make_app():
     return tornado.web.Application([
