@@ -222,15 +222,41 @@ def process_csv(input, output):
             csv_form.addRow(row)
 
 
-class MainHandler(tornado.web.RequestHandler):
+class FormHandler(tornado.web.RequestHandler):
+
+    def write_form(self, api_key_rp=None, api_key_fp=None):
+        if not api_key_rp:
+            api_key_rp = api_key_reverse_phone
+        if not api_key_fp:
+            api_key_fp = api_key_find_person
+
+        body = """
+        <html><body><form action="/filled.csv" method="POST" enctype="multipart/form-data">
+        <input type="file" name="csv"/>csv file<br/>
+        <input type="text" name="api_key_rp" value="{}"/>reverse phone api key<br/>
+        <input type="text" name="api_key_fp" value="{}"/>find person api key<br/>
+        <input type="submit" value="Submit"/>
+        </form></body></html>
+        """.format(api_key_rp, api_key_fp)
+
+        self.write(body)
+
+
     def get(self):
-        with open("sample.txt", encoding="utf-8") as f:
-            with open("result.csv", "w", encoding="utf-8") as r:
-                process_csv(f, r)
+        self.write_form()
+
+
+class ApiHandler(tornado.web.RequestHandler):
+
+    async def post(self):
+
+        self.set_header("Content-Type", "text/csv")
+        self.write("hello csv")
 
 def make_app():
     return tornado.web.Application([
-        (r"/", MainHandler),
+        (r"/filled.csv", ApiHandler),
+        (r"/", FormHandler)
     ])
 
 
